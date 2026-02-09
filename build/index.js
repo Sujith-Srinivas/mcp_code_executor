@@ -426,7 +426,7 @@ print(json.dumps(results))
             };
         }
         // Parse the package information
-        const packageInfo = JSON.parse(stdout.trim());
+        const packageInfo = JSON.parse(stdout.toString().trim());
         // Add summary information to make it easier to use
         const allInstalled = Object.values(packageInfo).every((info) => info.installed);
         const notInstalled = Object.entries(packageInfo)
@@ -451,6 +451,126 @@ print(json.dumps(results))
                 status: 'error',
                 env_type: ENV_CONFIG.type,
                 error: error instanceof Error ? error.message : String(error)
+            }),
+            isError: true
+        };
+    }
+}
+/**
+ * Execute JavaScript code using Node.js and return the result
+ */
+async function executeJavaScript(code, filePath) {
+    try {
+        // Write code to file
+        await writeFile(filePath, code, 'utf-8');
+        // Execute JavaScript using Node.js
+        const { stdout, stderr } = await execAsync(`node "${filePath}"`, {
+            cwd: CODE_STORAGE_DIR,
+            env: process.env,
+            shell: '/bin/bash'
+        });
+        const response = {
+            status: stderr ? 'error' : 'success',
+            output: stderr || stdout,
+            file_path: filePath,
+            language: 'javascript'
+        };
+        return {
+            type: 'text',
+            text: JSON.stringify(response),
+            isError: !!stderr
+        };
+    }
+    catch (error) {
+        const response = {
+            status: 'error',
+            error: error instanceof Error ? error.message : String(error),
+            file_path: filePath,
+            language: 'javascript'
+        };
+        return {
+            type: 'text',
+            text: JSON.stringify(response),
+            isError: true
+        };
+    }
+}
+/**
+ * Check if npm packages are installed
+ */
+async function checkInstalledNpmPackages(packages) {
+    try {
+        const installedPackages = {};
+        for (const pkg of packages) {
+            try {
+                // Try to require the package - if it doesn't throw, it's installed
+                await execAsync(`node -e "require.resolve('${pkg}')"`, {
+                    cwd: CODE_STORAGE_DIR
+                });
+                installedPackages[pkg] = true;
+            }
+            catch {
+                installedPackages[pkg] = false;
+            }
+        }
+        // Separate installed and not installed
+        const installed = Object.entries(installedPackages)
+            .filter(([_, isInstalled]) => isInstalled)
+            .map(([pkg, _]) => pkg);
+        const not_installed = Object.entries(installedPackages)
+            .filter(([_, isInstalled]) => !isInstalled)
+            .map(([pkg, _]) => pkg);
+        return {
+            type: 'text',
+            text: JSON.stringify({
+                status: 'success',
+                installed,
+                not_installed,
+                packages: installedPackages
+            }),
+            isError: false
+        };
+    }
+    catch (error) {
+        return {
+            type: 'text',
+            text: JSON.stringify({
+                status: 'error',
+                error: error instanceof Error ? error.message : String(error)
+            }),
+            isError: true
+        };
+    }
+}
+/**
+ * Install npm packages
+ */
+async function installNpmPackages(packages) {
+    try {
+        const packageList = packages.join(' ');
+        // Install packages using npm
+        const { stdout, stderr } = await execAsync(`npm install ${packageList}`, {
+            cwd: CODE_STORAGE_DIR,
+            env: process.env
+        });
+        return {
+            type: 'text',
+            text: JSON.stringify({
+                status: 'success',
+                message: `Installed packages: ${packageList}`,
+                output: stdout,
+                packages
+            }),
+            isError: false
+        };
+    }
+    catch (error) {
+        return {
+            type: 'text',
+            text: JSON.stringify({
+                status: 'error',
+                error: error instanceof Error ? error.message : String(error),
+                packages
             }),
             isError: true
         };
@@ -622,6 +742,58 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 inputSchema: {
                     type: "object",
                     properties: {}
+                }
+            },
+            {
+                name: "execute_javascript",
+                description: "Execute JavaScript code using Node.js. For short code snippets only.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        code: {
+                            type: "string",
+                            description: "JavaScript code to execute"
+                        },
+                        filename: {
+                            type: "string",
+                            description: "Optional: Name of the file to save the code (default: generated UUID)"
+                        }
+                    },
+                    required: ["code"]
+                }
+            },
+            {
+                name: "check_installed_npm_packages",
+                description: "Check if npm packages are installed in the Node.js environment",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        packages: {
+                            type: "array",
+                            items: {
+                                type: "string"
+                            },
+                            description: "List of npm packages to check"
+                        }
+                    },
+                    required: ["packages"]
+                }
+            },
+            {
+                name: "install_npm_packages",
+                description: "Install npm packages using npm install",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        packages: {
+                            type: "array",
+                            items: {
+                                type: "string"
+                            },
+                            description: "List of npm packages to install"
+                        }
+                    },
+                    required: ["packages"]
                 }
             }
         ]
@@ -842,6 +1014,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                         }),
                         isError: false
                     }]
+            };
+        }
+        case "execute_javascript": {
+            const args = request.params.arguments;
+            if (!args?.code) {
+                throw new Error("Code is required");
+            }
+            // Generate filename with .js extension
+            let actualFilename;
+            if (args.filename && typeof args.filename === 'string') {
+                const baseName = args.filename.replace(/\.js$/, '');
+                actualFilename = `${baseName}_${randomBytes(4).toString('hex')}.js`;
+            }
+            else {
+                actualFilename = `script_${randomBytes(4).toString('hex')}.js`;
+            }
+            const filePath = join(CODE_STORAGE_DIR, actualFilename);
+            const result = await executeJavaScript(args.code, filePath);
+            return {
+                content: [
+                    result
+                ]
+            };
+        }
+        case "check_installed_npm_packages": {
+            const args = request.params.arguments;
+            const packages = args.packages || [];
+            const result = await checkInstalledNpmPackages(packages);
+            return {
+                content: [
+                    result
+                ]
+            };
+        }
+        case "install_npm_packages": {
+            const args = request.params.arguments;
+            const packages = args.packages || [];
+            const result = await installNpmPackages(packages);
+            return {
+                content: [
+                    result
+                ]
             };
         }
         default:
